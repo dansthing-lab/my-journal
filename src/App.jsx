@@ -1,699 +1,830 @@
-import { useState, useEffect } from "react";
-import { initializeApp } from "firebase/app";
-import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, orderBy, query } from "firebase/firestore";
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar, Cell } from "recharts";
+import { useState, useEffect, useMemo, useCallback } from "react";
+import {
+  LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
+} from "recharts";
 
-const firebaseConfig = {
-  apiKey: "AIzaSyD8n57Try9rPq4MqjkxN4bgNxvhCsQUE9Y",
-  authDomain: "mytrading-journal-65b78.firebaseapp.com",
-  projectId: "mytrading-journal-65b78",
-  storageBucket: "mytrading-journal-65b78.firebasestorage.app",
-  messagingSenderId: "270111404918",
-  appId: "1:270111404918:web:0673982d9c95dcbf830057",
-};
+// ─── Constants ────────────────────────────────────────────────────────────────
+const STORAGE_KEY  = "wj_trades_v3";
+const EQUITY_KEY   = "wj_init_equity";
+const SESSIONS     = ["Asia", "London", "New York", "London+NY", "Pre-Market"];
+const TRENDS       = ["Bullish", "Bearish", "Sideways"];
+const POSITIONS    = ["Long", "Short"];
+const TIMEFRAMES   = ["M1","M5","M15","M30","H1","H4","D1","W1"];
+const RESULTS      = ["Win","Lose","Break Even"];
+const MONTHS_ID    = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
+const DAYS_ID      = ["Min","Sen","Sel","Rab","Kam","Jum","Sab"];
+const BLANK_FORM   = { date:"", session:"London", time:"", pair:"", trend:"Bullish", position:"Long", tf:"H1", playbook:"", duration:"", pnl:"", result:"Win", plan:"", evalNote:"" };
 
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-const tradesCol = collection(db, "trades");
-
-const SESSIONS = [
-  { id: "Asia",    label: "Asia",    icon: "🌏", color: "#f59e0b", hours: "00:00–09:00 WIB" },
-  { id: "London",  label: "London",  icon: "🇬🇧", color: "#60a5fa", hours: "14:00–23:00 WIB" },
-  { id: "NewYork", label: "New York",icon: "🗽", color: "#a78bfa", hours: "19:00–04:00 WIB" },
-  { id: "Other",   label: "Lainnya", icon: "⏱", color: "#64748b", hours: "" },
+const SAMPLE_TRADES = [
+  { id:"s1", date:"2025-04-07", session:"London",   time:"09:15", pair:"XAUUSD", trend:"Bullish", position:"Long",  tf:"H1",  playbook:"OB Retest",          duration:"3h 20m", pnl:250,  result:"Win",  plan:"Buy dip on OB zone",          evalNote:"Perfect entry, TP hit." },
+  { id:"s2", date:"2025-04-08", session:"New York", time:"14:30", pair:"EURUSD", trend:"Bearish", position:"Short", tf:"H4",  playbook:"BOS + CHoCH",         duration:"1h 45m", pnl:-120, result:"Lose", plan:"Short on CHoCH confirmation", evalNote:"SL hit by spike, reassess." },
+  { id:"s3", date:"2025-04-09", session:"London",   time:"10:00", pair:"XAUUSD", trend:"Bullish", position:"Long",  tf:"H1",  playbook:"FVG Fill",             duration:"2h 10m", pnl:380,  result:"Win",  plan:"FVG mitigation",              evalNote:"Held overnight, great R." },
+  { id:"s4", date:"2025-04-10", session:"Asia",     time:"05:30", pair:"GBPUSD", trend:"Bearish", position:"Short", tf:"M15", playbook:"Liquidity Sweep",      duration:"45m",    pnl:-85,  result:"Lose", plan:"Sell liquidity sweep",        evalNote:"NY session reversed fast." },
+  { id:"s5", date:"2025-04-14", session:"New York", time:"15:00", pair:"XAUUSD", trend:"Bullish", position:"Long",  tf:"H4",  playbook:"Weekly High Retrace",  duration:"5h",     pnl:520,  result:"Win",  plan:"Weekly high retest",          evalNote:"Best trade of the month." },
+  { id:"s6", date:"2025-04-16", session:"London",   time:"09:45", pair:"BTCUSD", trend:"Bullish", position:"Long",  tf:"H1",  playbook:"OB Retest",            duration:"2h",     pnl:430,  result:"Win",  plan:"Crypto OB on H1",             evalNote:"Confluence with weekly bias." },
+  { id:"s7", date:"2025-04-17", session:"Asia",     time:"04:00", pair:"USDJPY", trend:"Bearish", position:"Short", tf:"H4",  playbook:"Trend Continuation",   duration:"6h",     pnl:195,  result:"Win",  plan:"Short after rejection",       evalNote:"Clean move, patience paid." },
+  { id:"s8", date:"2025-04-22", session:"London",   time:"11:00", pair:"XAUUSD", trend:"Bearish", position:"Short", tf:"H1",  playbook:"FVG Fill",             duration:"1h 30m", pnl:-210, result:"Lose", plan:"Bearish FVG fill",            evalNote:"Gold reversed aggressively." },
 ];
 
-const EMPTY_FORM = {
-  pair: "", type: "Perp", direction: "Open Long", orderType: "Limit",
-  orderPrice: "", qty: "", tp: "", sl: "", status: "Pending", pnl: "", note: "", session: "Asia",
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const uid    = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
+const today  = () => new Date().toISOString().split("T")[0];
+const fmtUSD = (n, showSign = false) => {
+  const abs = Math.abs(n).toLocaleString("en-US", { minimumFractionDigits:2, maximumFractionDigits:2 });
+  if (!showSign) return `$${abs}`;
+  return `${n >= 0 ? "+" : "-"}$${abs}`;
+};
+const pct = (n, base) => ((n / base) * 100).toFixed(2) + "%";
+
+// ─── Colors ───────────────────────────────────────────────────────────────────
+const C = {
+  bg:        "#080d1a",
+  card:      "#0d1526",
+  surface:   "#111d34",
+  border:    "rgba(255,255,255,0.07)",
+  border2:   "rgba(255,255,255,0.12)",
+  green:     "#00d68f",
+  greenDim:  "rgba(0,214,143,0.12)",
+  red:       "#ff4d4d",
+  redDim:    "rgba(255,77,77,0.12)",
+  amber:     "#f5a623",
+  blue:      "#4f9cf9",
+  blueDim:   "rgba(79,156,249,0.12)",
+  purple:    "#a78bfa",
+  gray:      "#4b5679",
+  muted:     "#8892a4",
+  text:      "#dde3f0",
+  textBright:"#f4f7ff",
 };
 
-const DATE_FILTERS = ["Semua", "Hari Ini", "Minggu Ini", "Bulan Ini", "Bulan Lalu"];
-
-function SessionBadge({ session }) {
-  const s = SESSIONS.find(x => x.id === session) || SESSIONS[3];
-  return (
-    <span style={{ fontSize: 10, color: s.color, background: `${s.color}18`, border: `1px solid ${s.color}40`, borderRadius: 6, padding: "1px 7px", fontWeight: 700, letterSpacing: 0.5 }}>
-      {s.icon} {s.label}
-    </span>
-  );
-}
-
-function StatusBadge({ status }) {
-  const map = {
-    Pending:   { bg: "#1a2a1a", color: "#4ade80", border: "#166534" },
-    Filled:    { bg: "#1a1a2e", color: "#60a5fa", border: "#1d4ed8" },
-    Cancelled: { bg: "#2a1a1a", color: "#f87171", border: "#991b1b" },
-    "TP Hit":  { bg: "#0f2a1a", color: "#34d399", border: "#065f46" },
-    "SL Hit":  { bg: "#2a0f0f", color: "#fca5a5", border: "#7f1d1d" },
+// ─── Statistics ───────────────────────────────────────────────────────────────
+function calcStats(trades, initEquity) {
+  const n = trades.length;
+  if (!n) return { n:0, wins:0, losses:0, be:0, wr:"0.0", totalPnl:0, avgWin:0, avgLoss:0, rr:"—", equity:initEquity, pf:"—", maxDD:0, maxDDPct:"0.0", streak:0, streakType:"—", bestTrade:0, worstTrade:0 };
+  const sorted = [...trades].sort((a,b) => new Date(a.date) - new Date(b.date));
+  const wins   = sorted.filter(t => t.result === "Win");
+  const losses = sorted.filter(t => t.result === "Lose");
+  const be     = sorted.filter(t => t.result === "Break Even");
+  const totalPnl = sorted.reduce((s,t) => s + (t.pnl||0), 0);
+  const avgWin   = wins.length   ? wins.reduce((s,t)=>s+t.pnl,0)/wins.length   : 0;
+  const avgLoss  = losses.length ? Math.abs(losses.reduce((s,t)=>s+t.pnl,0)/losses.length) : 0;
+  const grossW   = wins.reduce((s,t)=>s+t.pnl,0);
+  const grossL   = Math.abs(losses.reduce((s,t)=>s+t.pnl,0));
+  let peak = initEquity, eq = initEquity, maxDD = 0;
+  sorted.forEach(t => { eq+=(t.pnl||0); if(eq>peak)peak=eq; const dd=peak-eq; if(dd>maxDD)maxDD=dd; });
+  let streak = 0, streakType = "—";
+  for (let i = sorted.length-1; i >= 0; i--) {
+    const r = sorted[i].result;
+    if (r==="Break Even") break;
+    if (streak===0) { streakType=r; streak=1; } else if (r===streakType) streak++; else break;
+  }
+  return {
+    n, wins:wins.length, losses:losses.length, be:be.length,
+    wr:(wins.length/n*100).toFixed(1),
+    totalPnl:parseFloat(totalPnl.toFixed(2)),
+    avgWin:parseFloat(avgWin.toFixed(2)),
+    avgLoss:parseFloat(avgLoss.toFixed(2)),
+    rr: avgLoss ? (avgWin/avgLoss).toFixed(2) : "∞",
+    equity:parseFloat((initEquity+totalPnl).toFixed(2)),
+    pf: grossL ? (grossW/grossL).toFixed(2) : grossW>0?"∞":"—",
+    maxDD:parseFloat(maxDD.toFixed(2)), maxDDPct:(maxDD/initEquity*100).toFixed(1),
+    streak, streakType,
+    bestTrade:  Math.max(...sorted.map(t=>t.pnl||0)),
+    worstTrade: Math.min(...sorted.map(t=>t.pnl||0)),
   };
-  const s = map[status] || map.Pending;
-  return <span style={{ background: s.bg, color: s.color, border: `1px solid ${s.border}`, borderRadius: 6, padding: "2px 10px", fontSize: 11, fontWeight: 700, letterSpacing: 1, fontFamily: "monospace" }}>{status}</span>;
 }
 
-function RRBadge({ tp, sl, price }) {
-  if (!tp || !sl || !price) return null;
-  const reward = Math.abs(tp - price);
-  const risk = Math.abs(price - sl);
-  const rr = risk > 0 ? (reward / risk).toFixed(2) : "—";
-  const color = parseFloat(rr) >= 2 ? "#34d399" : parseFloat(rr) >= 1 ? "#fbbf24" : "#f87171";
-  return <span style={{ color, fontSize: 11, fontWeight: 700, fontFamily: "monospace" }}>R:R {rr}</span>;
-}
-
-const inputStyle = {
-  width: "100%", background: "#0a0a0f", border: "1px solid #1e1e35", borderRadius: 8,
-  padding: "9px 11px", color: "#e2e8f0", fontFamily: "'DM Mono', 'Fira Code', monospace",
-  fontSize: 13, boxSizing: "border-box", outline: "none",
+// ─── Shared micro-styles ──────────────────────────────────────────────────────
+const inputSt = {
+  background:"#111d34", border:"1px solid rgba(255,255,255,0.09)",
+  borderRadius:7, padding:"8px 11px", color:"#dde3f0",
+  fontSize:12, fontFamily:"'DM Mono','Fira Code',monospace", width:"100%", outline:"none",
 };
-const selectStyle = { ...inputStyle, appearance: "none", cursor: "pointer" };
-const labelStyle = { fontSize: 10, color: "#475569", marginBottom: 5, letterSpacing: 1, display: "block" };
+const btnPri = {
+  background:"linear-gradient(135deg,#00d68f,#4f9cf9)",
+  border:"none", borderRadius:8, padding:"10px 20px",
+  color:"#fff", fontSize:12, fontWeight:700, letterSpacing:"0.8px",
+  textTransform:"uppercase", cursor:"pointer", fontFamily:"'DM Mono','Fira Code',monospace",
+};
+const btnSec = {
+  background:"transparent", border:"1px solid rgba(255,255,255,0.09)",
+  borderRadius:8, padding:"10px 20px", color:"#8892a4",
+  fontSize:12, cursor:"pointer", fontFamily:"'DM Mono','Fira Code',monospace",
+};
+const btnDng = {
+  background:"rgba(255,77,77,0.12)", border:"1px solid rgba(255,77,77,0.25)",
+  borderRadius:8, padding:"10px 20px", color:"#ff4d4d",
+  fontSize:12, cursor:"pointer", fontFamily:"'DM Mono','Fira Code',monospace",
+};
+const thSt = {
+  background:"#111d34", color:"#4b5679", fontSize:10,
+  letterSpacing:"0.7px", textTransform:"uppercase",
+  padding:"10px 12px", textAlign:"left",
+  borderBottom:"1px solid rgba(255,255,255,0.07)",
+  fontFamily:"'DM Mono','Fira Code',monospace",
+};
+const tdSt = { padding:"10px 12px", borderBottom:"1px solid rgba(255,255,255,0.04)", color:"#8892a4" };
 
-function filterByDate(trades, dateFilter) {
-  const now = new Date();
-  const today = now.toISOString().slice(0, 10);
-  const startOfWeek = new Date(now); startOfWeek.setDate(now.getDate() - now.getDay());
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-  const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0);
-  return trades.filter(t => {
-    const d = new Date(t.date);
-    if (dateFilter === "Semua") return true;
-    if (dateFilter === "Hari Ini") return t.date === today;
-    if (dateFilter === "Minggu Ini") return d >= startOfWeek;
-    if (dateFilter === "Bulan Ini") return d >= startOfMonth;
-    if (dateFilter === "Bulan Lalu") return d >= startOfLastMonth && d <= endOfLastMonth;
-    return true;
-  });
+// ─── Sub-components ───────────────────────────────────────────────────────────
+function Badge({ type }) {
+  const map = {
+    Win:         { bg:"rgba(0,214,143,0.15)",  color:C.green },
+    Lose:        { bg:"rgba(255,77,77,0.15)",   color:C.red   },
+    "Break Even":{ bg:"rgba(75,86,121,0.3)",    color:C.muted },
+    Long:        { bg:"rgba(79,156,249,0.15)",  color:C.blue  },
+    Short:       { bg:"rgba(245,166,35,0.15)",  color:C.amber },
+  };
+  const s = map[type] || { bg:"rgba(255,255,255,0.08)", color:C.muted };
+  return <span style={{ display:"inline-block", padding:"2px 7px", borderRadius:4, fontSize:10, fontWeight:700, letterSpacing:"0.4px", background:s.bg, color:s.color }}>{type}</span>;
 }
 
-// ── KALENDER PAGE ──────────────────────────────────────────────
-function CalendarPage({ trades, pnlColor }) {
-  const now = new Date();
-  const [viewYear, setViewYear] = useState(now.getFullYear());
-  const [viewMonth, setViewMonth] = useState(now.getMonth());
-  const [selectedDay, setSelectedDay] = useState(null);
-
-  const monthNames = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
-  const dayNames = ["Min","Sen","Sel","Rab","Kam","Jum","Sab"];
-
-  const prevMonth = () => { if (viewMonth === 0) { setViewYear(y => y-1); setViewMonth(11); } else setViewMonth(m => m-1); setSelectedDay(null); };
-  const nextMonth = () => { if (viewMonth === 11) { setViewYear(y => y+1); setViewMonth(0); } else setViewMonth(m => m+1); setSelectedDay(null); };
-
-  const firstDay = new Date(viewYear, viewMonth, 1).getDay();
-  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
-
-  // Build daily PnL map
-  const dailyMap = {};
-  trades.forEach(t => {
-    if (!dailyMap[t.date]) dailyMap[t.date] = { pnl: 0, trades: [], tp: 0, sl: 0 };
-    dailyMap[t.date].trades.push(t);
-    if (t.pnl !== null && t.pnl !== undefined) dailyMap[t.date].pnl += t.pnl;
-    if (t.status === "TP Hit") dailyMap[t.date].tp++;
-    if (t.status === "SL Hit") dailyMap[t.date].sl++;
-  });
-
-  const selectedKey = selectedDay ? `${viewYear}-${String(viewMonth+1).padStart(2,"0")}-${String(selectedDay).padStart(2,"0")}` : null;
-  const selectedData = selectedKey ? dailyMap[selectedKey] : null;
-
-  // Monthly summary
-  const monthTrades = trades.filter(t => {
-    const d = new Date(t.date);
-    return d.getFullYear() === viewYear && d.getMonth() === viewMonth;
-  });
-  const monthClosed = monthTrades.filter(t => t.status === "TP Hit" || t.status === "SL Hit");
-  const monthPnl = monthClosed.reduce((s, t) => s + (t.pnl || 0), 0);
-  const monthWins = monthClosed.filter(t => t.status === "TP Hit").length;
-  const monthWinRate = monthClosed.length > 0 ? ((monthWins / monthClosed.length) * 100).toFixed(0) : "—";
-
-  const cells = [];
-  for (let i = 0; i < firstDay; i++) cells.push(null);
-  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
-
+function MetricCard({ label, value, sub, color, accent, onClick }) {
   return (
-    <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: 12 }}>
+    <div onClick={onClick} style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"14px 16px", borderLeft:accent?`3px solid ${accent}`:undefined, cursor:onClick?"pointer":"default" }}>
+      <div style={{ fontSize:10, color:C.muted, letterSpacing:"0.9px", textTransform:"uppercase", marginBottom:6 }}>{label}</div>
+      <div style={{ fontSize:20, fontWeight:700, color:color||C.textBright, letterSpacing:"-0.5px", lineHeight:1.2 }}>{value}</div>
+      {sub && <div style={{ fontSize:11, color:C.gray, marginTop:4 }}>{sub}</div>}
+    </div>
+  );
+}
 
-      {/* Month nav */}
-      <div style={{ background: "#0f0f1a", border: "1px solid #1e1e35", borderRadius: 14, padding: "14px 16px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-          <button onClick={prevMonth} style={{ background: "#1e1e35", border: "none", borderRadius: 8, padding: "6px 12px", color: "#e2e8f0", cursor: "pointer", fontSize: 14 }}>‹</button>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 16, fontWeight: 800, color: "#f1f5f9" }}>{monthNames[viewMonth]}</div>
-            <div style={{ fontSize: 11, color: "#475569" }}>{viewYear}</div>
-          </div>
-          <button onClick={nextMonth} style={{ background: "#1e1e35", border: "none", borderRadius: 8, padding: "6px 12px", color: "#e2e8f0", cursor: "pointer", fontSize: 14 }}>›</button>
+function ChartTip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={{ background:"#1a2540", border:`1px solid ${C.border2}`, borderRadius:8, padding:"8px 12px", fontSize:11 }}>
+      <div style={{ color:C.muted, marginBottom:4 }}>{label}</div>
+      {payload.map((p,i) => (
+        <div key={i} style={{ color:p.color||C.green, fontWeight:600 }}>
+          {p.name}: {typeof p.value==="number" ? fmtUSD(p.value, p.value!==0) : p.value}
         </div>
+      ))}
+    </div>
+  );
+}
 
-        {/* Day headers */}
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 4 }}>
-          {dayNames.map(d => <div key={d} style={{ textAlign: "center", fontSize: 9, color: "#475569", fontWeight: 700, padding: "4px 0" }}>{d}</div>)}
+function Toast({ msg, type }) {
+  return (
+    <div style={{ position:"fixed", top:16, right:16, zIndex:9999, background:type==="error"?C.red:C.green, color:"#fff", borderRadius:8, padding:"10px 18px", fontSize:12, fontWeight:700, letterSpacing:"0.5px", boxShadow:"0 8px 32px rgba(0,0,0,0.5)", animation:"slideIn .2s ease" }}>
+      {msg}
+    </div>
+  );
+}
+
+function FormField({ label, children }) {
+  return (
+    <div>
+      <div style={{ fontSize:10, color:"#4b5679", letterSpacing:"0.8px", textTransform:"uppercase", marginBottom:5 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+// ─── Editable Equity Modal ────────────────────────────────────────────────────
+function EquityModal({ current, onSave, onClose }) {
+  const [val, setVal] = useState(String(current));
+  const parsed = parseFloat(val);
+  const valid  = !isNaN(parsed) && parsed > 0;
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center" }} onClick={onClose}>
+      <div style={{ background:C.card, border:`1px solid ${C.border2}`, borderRadius:14, padding:"28px 32px", width:380, boxShadow:"0 24px 64px rgba(0,0,0,0.6)", animation:"fadeUp .2s ease" }} onClick={e=>e.stopPropagation()}>
+        <div style={{ fontSize:15, fontWeight:700, color:C.textBright, marginBottom:4 }}>✏️ Edit Initial Equity</div>
+        <div style={{ fontSize:12, color:C.muted, marginBottom:20, lineHeight:1.6 }}>Ubah modal awal. Semua perhitungan equity curve & % gain akan otomatis menyesuaikan.</div>
+        <FormField label="Initial Equity ($)">
+          <input autoFocus type="number" min="1" step="100" value={val} onChange={e=>setVal(e.target.value)}
+            style={{ ...inputSt, marginBottom:6, fontSize:20, fontWeight:700, color:valid?C.green:C.red }} />
+        </FormField>
+        {!valid && <div style={{ fontSize:11, color:C.red, marginBottom:8 }}>Masukkan angka valid (&gt; 0)</div>}
+        <div style={{ fontSize:12, color:C.muted, marginBottom:20, marginTop:8 }}>
+          Initial equity baru: <span style={{ color:valid?C.textBright:C.muted, fontWeight:600 }}>{valid?fmtUSD(parsed):"—"}</span>
         </div>
-
-        {/* Calendar cells */}
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3 }}>
-          {cells.map((day, i) => {
-            if (!day) return <div key={i} />;
-            const key = `${viewYear}-${String(viewMonth+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
-            const data = dailyMap[key];
-            const isToday = key === new Date().toISOString().slice(0,10);
-            const isSelected = day === selectedDay;
-            let bg = "#12121f", border = "#1e1e35", dotColor = null;
-            if (data) {
-              const hasClosed = data.tp > 0 || data.sl > 0;
-              if (hasClosed) {
-                if (data.pnl > 0) { bg = "rgba(52,211,153,0.12)"; border = "#065f46"; dotColor = "#34d399"; }
-                else if (data.pnl < 0) { bg = "rgba(248,113,113,0.12)"; border = "#7f1d1d"; dotColor = "#f87171"; }
-                else { bg = "rgba(100,116,139,0.12)"; border = "#334155"; dotColor = "#64748b"; }
-              } else if (data.trades.length > 0) {
-                bg = "rgba(99,102,241,0.1)"; border = "#2d2d4a"; dotColor = "#6366f1";
-              }
-            }
-            return (
-              <div key={i} onClick={() => setSelectedDay(isSelected ? null : day)} style={{
-                background: isSelected ? "#6366f1" : bg,
-                border: `1px solid ${isSelected ? "#6366f1" : isToday ? "#6366f1" : border}`,
-                borderRadius: 8, padding: "6px 4px", textAlign: "center", cursor: data ? "pointer" : "default",
-                minHeight: 38, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-              }}>
-                <div style={{ fontSize: 11, fontWeight: isToday ? 800 : 500, color: isSelected ? "#fff" : isToday ? "#a5b4fc" : "#e2e8f0" }}>{day}</div>
-                {dotColor && !isSelected && <div style={{ width: 4, height: 4, borderRadius: "50%", background: dotColor, marginTop: 2 }} />}
-                {data && isSelected && <div style={{ fontSize: 8, color: "#fff", marginTop: 1 }}>{data.trades.length}T</div>}
-              </div>
-            );
-          })}
+        <div style={{ display:"flex", gap:10 }}>
+          <button style={{ ...btnPri, flex:1, opacity:valid?1:0.4 }} disabled={!valid} onClick={()=>valid&&onSave(parsed)}>Simpan</button>
+          <button style={{ ...btnSec, flex:1 }} onClick={onClose}>Batal</button>
         </div>
-      </div>
-
-      {/* Selected day detail */}
-      {selectedDay && (
-        <div style={{ background: "#0f0f1a", border: "1px solid #2d2d4a", borderRadius: 14, padding: "14px 16px" }}>
-          <div style={{ fontSize: 10, color: "#6366f1", letterSpacing: 2, marginBottom: 10, fontWeight: 700 }}>
-            {selectedDay} {monthNames[viewMonth]} {viewYear}
-          </div>
-          {selectedData ? (
-            <>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 12 }}>
-                <div style={{ textAlign: "center" }}><div style={{ fontSize: 9, color: "#475569" }}>TRADE</div><div style={{ fontSize: 18, fontWeight: 800, color: "#a78bfa" }}>{selectedData.trades.length}</div></div>
-                <div style={{ textAlign: "center" }}><div style={{ fontSize: 9, color: "#475569" }}>W/L</div><div style={{ fontSize: 18, fontWeight: 800 }}><span style={{ color: "#34d399" }}>{selectedData.tp}</span><span style={{ color: "#475569" }}>/</span><span style={{ color: "#f87171" }}>{selectedData.sl}</span></div></div>
-                <div style={{ textAlign: "center" }}><div style={{ fontSize: 9, color: "#475569" }}>PnL</div><div style={{ fontSize: 14, fontWeight: 800, color: pnlColor(selectedData.pnl) }}>{selectedData.pnl >= 0 ? "+" : ""}{selectedData.pnl.toFixed(2)}</div></div>
-              </div>
-              {selectedData.trades.map(t => (
-                <div key={t.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderTop: "1px solid #1e1e35" }}>
-                  <div>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{t.pair}</span>
-                    {t.session && <SessionBadge session={t.session} />}
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <StatusBadge status={t.status} />
-                    {t.pnl !== null && t.pnl !== undefined && (
-                      <div style={{ fontSize: 12, fontWeight: 700, color: pnlColor(t.pnl), marginTop: 2 }}>{t.pnl >= 0 ? "+" : ""}{t.pnl} USDT</div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </>
-          ) : (
-            <div style={{ textAlign: "center", color: "#334155", fontSize: 12, padding: "16px 0" }}>Tidak ada trade di hari ini</div>
-          )}
-        </div>
-      )}
-
-      {/* Monthly summary */}
-      <div style={{ background: "#0f0f1a", border: "1px solid #1e1e35", borderRadius: 14, padding: "14px 16px" }}>
-        <div style={{ fontSize: 10, color: "#475569", letterSpacing: 2, marginBottom: 10 }}>RINGKASAN {monthNames[viewMonth].toUpperCase()}</div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
-          {[
-            { label: "Total Trade", value: monthTrades.length, color: "#a78bfa" },
-            { label: "Win Rate", value: monthWinRate === "—" ? "—" : `${monthWinRate}%`, color: parseFloat(monthWinRate) >= 50 ? "#34d399" : "#f87171" },
-            { label: "Net P/L", value: `${monthPnl >= 0 ? "+" : ""}${monthPnl.toFixed(1)}`, color: pnlColor(monthPnl) },
-          ].map(s => (
-            <div key={s.label} style={{ textAlign: "center" }}>
-              <div style={{ fontSize: 18, fontWeight: 800, color: s.color }}>{s.value}</div>
-              <div style={{ fontSize: 9, color: "#64748b" }}>{s.label}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Legend */}
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", padding: "0 4px" }}>
-        {[["#34d399","Profit"],["#f87171","Loss"],["#6366f1","Pending/Filled"],["#64748b","Breakeven"]].map(([c,l]) => (
-          <div key={l} style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <div style={{ width: 8, height: 8, borderRadius: "50%", background: c }} />
-            <span style={{ fontSize: 10, color: "#64748b" }}>{l}</span>
-          </div>
-        ))}
       </div>
     </div>
   );
 }
 
-// ── STATISTICS PAGE ────────────────────────────────────────────
-function StatisticsPage({ trades, pnlColor }) {
-  const closed = trades.filter(t => t.status === "TP Hit" || t.status === "SL Hit");
-  const wins   = trades.filter(t => t.status === "TP Hit");
-  const losses = trades.filter(t => t.status === "SL Hit");
-  const winRate = closed.length > 0 ? ((wins.length / closed.length) * 100).toFixed(1) : 0;
-  const totalPnl = closed.reduce((s, t) => s + (t.pnl || 0), 0);
-
-  const sortedClosed = [...closed].sort((a, b) => new Date(a.date) - new Date(b.date));
-  let cumulative = 0;
-  const equityCurve = sortedClosed.map(t => { cumulative += (t.pnl || 0); return { date: t.date.slice(5), pnl: parseFloat(cumulative.toFixed(2)) }; });
-
-  const pairMap = {};
-  closed.forEach(t => { if (!pairMap[t.pair]) pairMap[t.pair] = 0; pairMap[t.pair] += (t.pnl || 0); });
-  const pairData = Object.entries(pairMap).map(([pair, pnl]) => ({ pair, pnl: parseFloat(pnl.toFixed(2)) })).sort((a, b) => b.pnl - a.pnl);
-
-  const dailyMap = {};
-  closed.forEach(t => { if (!dailyMap[t.date]) dailyMap[t.date] = 0; dailyMap[t.date] += (t.pnl || 0); });
-  const dailyData = Object.entries(dailyMap).map(([date, pnl]) => ({ date: date.slice(5), pnl: parseFloat(pnl.toFixed(2)) })).sort((a, b) => a.date.localeCompare(b.date));
-
-  // Session analysis
-  const sessionMap = {};
-  SESSIONS.forEach(s => { sessionMap[s.id] = { win: 0, loss: 0, pnl: 0, total: 0 }; });
-  closed.forEach(t => {
-    const sid = t.session || "Other";
-    if (!sessionMap[sid]) sessionMap[sid] = { win: 0, loss: 0, pnl: 0, total: 0 };
-    sessionMap[sid].total++;
-    sessionMap[sid].pnl += (t.pnl || 0);
-    if (t.status === "TP Hit") sessionMap[sid].win++;
-    else sessionMap[sid].loss++;
-  });
-
-  const rrTrades = trades.filter(t => t.tp && t.sl && t.orderPrice);
-  const avgRR = rrTrades.length > 0 ? (rrTrades.reduce((s, t) => { const reward = Math.abs(t.tp - t.orderPrice); const risk = Math.abs(t.orderPrice - t.sl); return s + (risk > 0 ? reward / risk : 0); }, 0) / rrTrades.length).toFixed(2) : "—";
-
-  const cardStyle = { background: "#0f0f1a", border: "1px solid #1e1e35", borderRadius: 14, padding: "16px" };
-
+// ─── Trade Detail Drawer ──────────────────────────────────────────────────────
+function TradeDrawer({ trade, initEquity, onClose, onDelete, onEdit }) {
+  if (!trade) return null;
+  const gainPct = ((trade.pnl / initEquity) * 100).toFixed(2);
   return (
-    <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: 12 }}>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+    <>
+      <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:150 }} onClick={onClose} />
+      <div style={{ position:"fixed", top:0, right:0, bottom:0, width:360, background:C.card, borderLeft:`1px solid ${C.border2}`, zIndex:151, overflowY:"auto", padding:24, display:"flex", flexDirection:"column", gap:14, animation:"slideIn .25s ease" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+          <div>
+            <div style={{ fontSize:22, fontWeight:700, color:C.textBright, letterSpacing:"-0.5px" }}>{trade.pair}</div>
+            <div style={{ display:"flex", gap:6, marginTop:7 }}><Badge type={trade.position} /><Badge type={trade.result} /></div>
+          </div>
+          <button onClick={onClose} style={{ background:"none", border:"none", cursor:"pointer", color:C.muted, fontSize:20, padding:4 }}>✕</button>
+        </div>
+
+        <div style={{ background:trade.pnl>=0?C.greenDim:C.redDim, border:`1px solid ${trade.pnl>=0?"rgba(0,214,143,0.2)":"rgba(255,77,77,0.2)"}`, borderRadius:10, padding:"16px 18px", textAlign:"center" }}>
+          <div style={{ fontSize:10, color:C.muted, letterSpacing:"0.8px", textTransform:"uppercase", marginBottom:4 }}>Net PnL</div>
+          <div style={{ fontSize:34, fontWeight:700, color:trade.pnl>=0?C.green:C.red, letterSpacing:"-1px" }}>{fmtUSD(trade.pnl, true)}</div>
+          <div style={{ fontSize:12, color:C.muted, marginTop:2 }}>{trade.pnl>=0?"+":""}{gainPct}% of initial equity</div>
+        </div>
+
         {[
-          { label: "WIN RATE", value: `${winRate}%`, color: parseFloat(winRate) >= 50 ? "#34d399" : "#f87171" },
-          { label: "NET P/L", value: `${totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)} USDT`, color: pnlColor(totalPnl) },
-          { label: "TOTAL TRADE", value: trades.length, color: "#a78bfa" },
-          { label: "AVG R:R", value: avgRR, color: "#fbbf24" },
-          { label: "BEST TRADE", value: wins.length > 0 ? `+${Math.max(...wins.map(t => t.pnl||0)).toFixed(2)}` : "—", color: "#34d399" },
-          { label: "WORST TRADE", value: losses.length > 0 ? `${Math.min(...losses.map(t => t.pnl||0)).toFixed(2)}` : "—", color: "#f87171" },
-        ].map(s => (
-          <div key={s.label} style={cardStyle}>
-            <div style={{ fontSize: 9, color: "#475569", letterSpacing: 2, marginBottom: 4 }}>{s.label}</div>
-            <div style={{ fontSize: 18, fontWeight: 900, color: s.color }}>{s.value}</div>
+          ["Date",       trade.date      || "—"],
+          ["Session",    trade.session   || "—"],
+          ["Entry Time", trade.time      || "—"],
+          ["Timeframe",  trade.tf],
+          ["Trend",      trade.trend],
+          ["Duration",   trade.duration  || "—"],
+          ["Playbook",   trade.playbook  || "—"],
+        ].map(([label, value]) => (
+          <div key={label} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:`1px solid ${C.border}` }}>
+            <span style={{ fontSize:10, color:C.muted, letterSpacing:"0.5px", textTransform:"uppercase" }}>{label}</span>
+            <span style={{ fontSize:12, color:C.text, fontWeight:500 }}>{value}</span>
           </div>
         ))}
-      </div>
 
-      {/* Session Analysis */}
-      <div style={cardStyle}>
-        <div style={{ fontSize: 10, color: "#475569", letterSpacing: 2, marginBottom: 12 }}>PERFORMA PER SESSION</div>
-        {SESSIONS.filter(s => sessionMap[s.id]?.total > 0).length === 0 ? (
-          <div style={{ fontSize: 12, color: "#334155", textAlign: "center", padding: "12px 0" }}>Belum ada data session</div>
-        ) : (
-          SESSIONS.map(s => {
-            const d = sessionMap[s.id];
-            if (!d || d.total === 0) return null;
-            const wr = d.total > 0 ? ((d.win / d.total) * 100).toFixed(0) : 0;
-            return (
-              <div key={s.id} style={{ marginBottom: 12 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ fontSize: 14 }}>{s.icon}</span>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: s.color }}>{s.label}</span>
-                    <span style={{ fontSize: 10, color: "#475569" }}>{d.total} trade</span>
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: pnlColor(d.pnl) }}>{d.pnl >= 0 ? "+" : ""}{d.pnl.toFixed(2)} USDT</span>
-                    <span style={{ fontSize: 10, color: "#475569", marginLeft: 8 }}>{wr}% WR</span>
-                  </div>
-                </div>
-                <div style={{ height: 4, background: "#1e1e35", borderRadius: 4, overflow: "hidden" }}>
-                  <div style={{ height: "100%", width: `${wr}%`, background: s.color, borderRadius: 4, transition: "width 0.6s ease" }} />
-                </div>
-              </div>
-            );
-          })
+        {trade.plan && (
+          <div>
+            <div style={{ fontSize:10, color:C.muted, letterSpacing:"0.8px", textTransform:"uppercase", marginBottom:6 }}>Trade Plan</div>
+            <div style={{ fontSize:12, color:C.text, background:C.surface, borderRadius:8, padding:"10px 12px", lineHeight:1.7 }}>{trade.plan}</div>
+          </div>
         )}
+        {trade.evalNote && (
+          <div>
+            <div style={{ fontSize:10, color:C.muted, letterSpacing:"0.8px", textTransform:"uppercase", marginBottom:6 }}>Evaluasi</div>
+            <div style={{ fontSize:12, color:C.text, background:C.surface, borderRadius:8, padding:"10px 12px", lineHeight:1.7 }}>{trade.evalNote}</div>
+          </div>
+        )}
+
+        <div style={{ display:"flex", gap:8, marginTop:"auto", paddingTop:8 }}>
+          <button style={{ ...btnPri, flex:1, fontSize:11 }} onClick={()=>onEdit(trade)}>✏️ Edit</button>
+          <button style={{ ...btnDng, flex:1, fontSize:11 }} onClick={()=>{ onDelete(trade.id); onClose(); }}>🗑 Hapus</button>
+        </div>
       </div>
+    </>
+  );
+}
 
-      {equityCurve.length > 0 && (
-        <div style={cardStyle}>
-          <div style={{ fontSize: 10, color: "#475569", letterSpacing: 2, marginBottom: 12 }}>EQUITY CURVE</div>
-          <ResponsiveContainer width="100%" height={160}>
-            <LineChart data={equityCurve}>
-              <XAxis dataKey="date" tick={{ fontSize: 9, fill: "#475569" }} tickLine={false} axisLine={false} />
-              <YAxis tick={{ fontSize: 9, fill: "#475569" }} tickLine={false} axisLine={false} />
-              <Tooltip contentStyle={{ background: "#12121f", border: "1px solid #1e1e35", borderRadius: 8, fontSize: 11 }} labelStyle={{ color: "#94a3b8" }} formatter={(v) => [`${v >= 0 ? "+" : ""}${v} USDT`, "PnL"]} />
-              <Line type="monotone" dataKey="pnl" stroke="#6366f1" strokeWidth={2} dot={{ fill: "#6366f1", r: 3 }} />
-            </LineChart>
-          </ResponsiveContainer>
+// ─── Edit Trade Modal ─────────────────────────────────────────────────────────
+function EditModal({ trade, onSave, onClose }) {
+  const [form, setForm] = useState({ ...trade, pnl:String(trade.pnl) });
+  const set = k => e => setForm(p=>({...p,[k]:e.target.value}));
+  const save = () => {
+    const pnlNum = parseFloat(form.pnl);
+    if (!form.pair.trim()) return;
+    onSave({ ...form, pair:form.pair.toUpperCase().trim(), pnl:isNaN(pnlNum)?0:pnlNum });
+  };
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.8)", zIndex:210, display:"flex", alignItems:"center", justifyContent:"center", padding:16 }} onClick={onClose}>
+      <div style={{ background:C.card, border:`1px solid ${C.border2}`, borderRadius:14, padding:24, width:"100%", maxWidth:620, maxHeight:"90vh", overflowY:"auto", boxShadow:"0 24px 64px rgba(0,0,0,0.7)", animation:"fadeUp .2s ease" }} onClick={e=>e.stopPropagation()}>
+        <div style={{ fontSize:14, fontWeight:700, color:C.textBright, marginBottom:20 }}>✏️ Edit Trade — {trade.pair}</div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))", gap:12, marginBottom:12 }}>
+          <FormField label="Date"><input type="date" style={inputSt} value={form.date} onChange={set("date")} /></FormField>
+          <FormField label="Session"><select style={inputSt} value={form.session} onChange={set("session")}>{SESSIONS.map(s=><option key={s}>{s}</option>)}</select></FormField>
+          <FormField label="Entry Time"><input type="time" style={inputSt} value={form.time} onChange={set("time")} /></FormField>
+          <FormField label="Pair"><input type="text" style={inputSt} value={form.pair} onChange={set("pair")} /></FormField>
+          <FormField label="Trend"><select style={inputSt} value={form.trend} onChange={set("trend")}>{TRENDS.map(t=><option key={t}>{t}</option>)}</select></FormField>
+          <FormField label="Position"><select style={inputSt} value={form.position} onChange={set("position")}>{POSITIONS.map(p=><option key={p}>{p}</option>)}</select></FormField>
+          <FormField label="Timeframe"><select style={inputSt} value={form.tf} onChange={set("tf")}>{TIMEFRAMES.map(t=><option key={t}>{t}</option>)}</select></FormField>
+          <FormField label="Playbook"><input type="text" style={inputSt} value={form.playbook} onChange={set("playbook")} /></FormField>
+          <FormField label="Duration"><input type="text" style={inputSt} value={form.duration} onChange={set("duration")} /></FormField>
+          <FormField label="PnL ($)"><input type="number" style={{ ...inputSt, color:parseFloat(form.pnl)>=0?C.green:C.red, fontWeight:700 }} step="0.01" value={form.pnl} onChange={set("pnl")} /></FormField>
+          <FormField label="Result"><select style={inputSt} value={form.result} onChange={set("result")}>{RESULTS.map(r=><option key={r}>{r}</option>)}</select></FormField>
         </div>
-      )}
-
-      {dailyData.length > 0 && (
-        <div style={cardStyle}>
-          <div style={{ fontSize: 10, color: "#475569", letterSpacing: 2, marginBottom: 12 }}>PnL HARIAN</div>
-          <ResponsiveContainer width="100%" height={140}>
-            <BarChart data={dailyData}>
-              <XAxis dataKey="date" tick={{ fontSize: 9, fill: "#475569" }} tickLine={false} axisLine={false} />
-              <YAxis tick={{ fontSize: 9, fill: "#475569" }} tickLine={false} axisLine={false} />
-              <Tooltip contentStyle={{ background: "#12121f", border: "1px solid #1e1e35", borderRadius: 8, fontSize: 11 }} formatter={(v) => [`${v >= 0 ? "+" : ""}${v} USDT`, "PnL"]} />
-              <Bar dataKey="pnl" radius={[4,4,0,0]}>{dailyData.map((e,i) => <Cell key={i} fill={e.pnl >= 0 ? "#34d399" : "#f87171"} />)}</Bar>
-            </BarChart>
-          </ResponsiveContainer>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:18 }}>
+          <FormField label="Trade Plan"><textarea style={{ ...inputSt, minHeight:70, resize:"vertical" }} value={form.plan} onChange={set("plan")} /></FormField>
+          <FormField label="Evaluasi"><textarea style={{ ...inputSt, minHeight:70, resize:"vertical" }} value={form.evalNote} onChange={set("evalNote")} /></FormField>
         </div>
-      )}
-
-      {pairData.length > 0 && (
-        <div style={cardStyle}>
-          <div style={{ fontSize: 10, color: "#475569", letterSpacing: 2, marginBottom: 12 }}>PERFORMA PER PAIR</div>
-          {pairData.map(p => (
-            <div key={p.pair} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <span style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0" }}>{p.pair}</span>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <div style={{ width: 80, height: 4, background: "#1e1e35", borderRadius: 4, overflow: "hidden" }}>
-                  <div style={{ height: "100%", width: `${Math.min(Math.abs(p.pnl)/Math.max(...pairData.map(x=>Math.abs(x.pnl)))*100,100)}%`, background: p.pnl >= 0 ? "#34d399" : "#f87171", borderRadius: 4 }} />
-                </div>
-                <span style={{ fontSize: 12, fontWeight: 700, color: pnlColor(p.pnl), minWidth: 70, textAlign: "right" }}>{p.pnl >= 0 ? "+" : ""}{p.pnl} USDT</span>
-              </div>
-            </div>
-          ))}
+        <div style={{ display:"flex", gap:10 }}>
+          <button style={{ ...btnPri, flex:1 }} onClick={save}>Simpan Perubahan</button>
+          <button style={{ ...btnSec, flex:1 }} onClick={onClose}>Batal</button>
         </div>
-      )}
-
-      {closed.length === 0 && <div style={{ textAlign: "center", color: "#334155", padding: "40px 0", fontSize: 13 }}>Belum ada closed trade.</div>}
+      </div>
     </div>
   );
 }
 
-// ── MAIN APP ───────────────────────────────────────────────────
+// ─── Main App ─────────────────────────────────────────────────────────────────
 export default function TradingJournal() {
-  const [trades, setTrades]             = useState([]);
-  const [loading, setLoading]           = useState(true);
-  const [showForm, setShowForm]         = useState(false);
-  const [form, setForm]                 = useState(EMPTY_FORM);
-  const [formError, setFormError]       = useState("");
-  const [editId, setEditId]             = useState(null);
-  const [editData, setEditData]         = useState({});
-  const [statusFilter, setStatusFilter] = useState("All");
-  const [sessionFilter, setSessionFilter] = useState("All");
-  const [dateFilter, setDateFilter]     = useState("Semua");
-  const [expandedId, setExpandedId]     = useState(null);
-  const [dbError, setDbError]           = useState("");
-  const [page, setPage]                 = useState("journal");
+  const [trades,      setTrades]      = useState(() => { try { const s=localStorage.getItem(STORAGE_KEY); return s?JSON.parse(s):SAMPLE_TRADES; } catch { return SAMPLE_TRADES; } });
+  const [initEquity,  setInitEquity]  = useState(() => { try { return parseFloat(localStorage.getItem(EQUITY_KEY))||10000; } catch { return 10000; } });
+  const [tab,         setTab]         = useState("dashboard");
+  const [toast,       setToast]       = useState(null);
+  const [showEqModal, setShowEqModal] = useState(false);
+  const [drawer,      setDrawer]      = useState(null);
+  const [editTrade,   setEditTrade]   = useState(null);
+  const [form,        setForm]        = useState({ ...BLANK_FORM, date:today() });
+  const [filterPair,       setFilterPair]      = useState("");
+  const [filterResult,     setFilterResult]    = useState("");
+  const [filterPosition,   setFilterPosition]  = useState("");
+  const [sortKey,     setSortKey]     = useState("date");
+  const [sortDir,     setSortDir]     = useState("desc");
+  const [calMonth,    setCalMonth]    = useState(new Date().getMonth());
+  const [calYear,     setCalYear]     = useState(new Date().getFullYear());
+  const [calDetail,   setCalDetail]   = useState(null);
 
-  useEffect(() => {
-    const q = query(tradesCol, orderBy("createdAt", "desc"));
-    const unsub = onSnapshot(q,
-      (snap) => { setTrades(snap.docs.map(d => ({ id: d.id, ...d.data() }))); setLoading(false); setDbError(""); },
-      (err)  => { console.error(err); setDbError("Gagal terhubung ke database."); setLoading(false); }
-    );
-    return () => unsub();
+  useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(trades)); }, [trades]);
+  useEffect(() => { localStorage.setItem(EQUITY_KEY, String(initEquity)); }, [initEquity]);
+
+  const showToast = useCallback((msg, type="success") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 2800);
   }, []);
 
-  const pnlColor = (v) => v > 0 ? "#34d399" : v < 0 ? "#f87171" : "#9ca3af";
+  const stats = useMemo(() => calcStats(trades, initEquity), [trades, initEquity]);
 
-  const dateTrades = filterByDate(trades, dateFilter);
-  const sessionTrades = sessionFilter === "All" ? dateTrades : dateTrades.filter(t => (t.session || "Other") === sessionFilter);
-  const closedTrades = sessionTrades.filter(t => t.status === "TP Hit" || t.status === "SL Hit");
-  const winTrades    = sessionTrades.filter(t => t.status === "TP Hit");
-  const lossTrades   = sessionTrades.filter(t => t.status === "SL Hit");
-  const winRate      = closedTrades.length > 0 ? ((winTrades.length / closedTrades.length) * 100).toFixed(1) : null;
-  const stats = {
-    total: sessionTrades.length, pending: sessionTrades.filter(t => t.status === "Pending").length,
-    tp: winTrades.length, sl: lossTrades.length,
-    totalPnl: sessionTrades.reduce((s, t) => s + (t.pnl || 0), 0),
-    totalProfit: winTrades.reduce((s, t) => s + (t.pnl || 0), 0),
-    totalLoss: lossTrades.reduce((s, t) => s + (t.pnl || 0), 0),
-    winRate, closedCount: closedTrades.length,
+  const equityCurve = useMemo(() => {
+    const sorted = [...trades].sort((a,b)=>new Date(a.date)-new Date(b.date));
+    let eq = initEquity;
+    return [
+      { name:"Start", equity:initEquity, pnl:0 },
+      ...sorted.map((t,i) => { eq+=(t.pnl||0); return { name:`#${i+1}`, equity:parseFloat(eq.toFixed(2)), pnl:t.pnl, pair:t.pair }; })
+    ];
+  }, [trades, initEquity]);
+
+  const pnlBars = useMemo(() =>
+    [...trades].sort((a,b)=>new Date(a.date)-new Date(b.date)).slice(-30).map((t,i)=>({ name:`#${i+1}`, pnl:t.pnl, pair:t.pair, result:t.result })),
+    [trades]);
+
+  const winLosePie = useMemo(() => [
+    { name:"Win",  value:stats.wins,   color:C.green },
+    { name:"Lose", value:stats.losses, color:C.red   },
+    { name:"BE",   value:stats.be,     color:C.gray  },
+  ].filter(d=>d.value>0), [stats]);
+
+  const pairBars = useMemo(() => {
+    const map = {};
+    trades.forEach(t => {
+      if (!map[t.pair]) map[t.pair]={ pair:t.pair, pnl:0, count:0 };
+      map[t.pair].pnl+=(t.pnl||0); map[t.pair].count++;
+    });
+    return Object.values(map).sort((a,b)=>b.pnl-a.pnl).map(d=>({ ...d, pnl:parseFloat(d.pnl.toFixed(2)) }));
+  }, [trades]);
+
+  const pairs = useMemo(() => [...new Set(trades.map(t=>t.pair))], [trades]);
+
+  const equityMap = useMemo(() => {
+    const sorted = [...trades].sort((a,b)=>new Date(a.date)-new Date(b.date));
+    let eq = initEquity; const m = {};
+    sorted.forEach(t => { eq+=(t.pnl||0); m[t.id]=parseFloat(eq.toFixed(2)); });
+    return m;
+  }, [trades, initEquity]);
+
+  const filteredTrades = useMemo(() => {
+    let list = trades.filter(t =>
+      (!filterPair     || t.pair     === filterPair)    &&
+      (!filterResult   || t.result   === filterResult)  &&
+      (!filterPosition || t.position === filterPosition)
+    );
+    return list.sort((a,b) => {
+      let va = sortKey==="pnl" ? a.pnl : sortKey==="date" ? new Date(a.date||0) : a[sortKey];
+      let vb = sortKey==="pnl" ? b.pnl : sortKey==="date" ? new Date(b.date||0) : b[sortKey];
+      if (va<vb) return sortDir==="asc"?-1:1;
+      if (va>vb) return sortDir==="asc"?1:-1;
+      return 0;
+    });
+  }, [trades, filterPair, filterResult, filterPosition, sortKey, sortDir]);
+
+  const toggleSort = key => {
+    if (sortKey===key) setSortDir(d=>d==="asc"?"desc":"asc");
+    else { setSortKey(key); setSortDir("desc"); }
   };
-  const filteredTrades = statusFilter === "All" ? sessionTrades : sessionTrades.filter(t => t.status === statusFilter);
-  const fc = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-  const handleAddTrade = async () => {
-    if (!form.pair.trim()) { setFormError("Pair wajib diisi"); return; }
-    if (!form.orderPrice)  { setFormError("Entry Price wajib diisi"); return; }
-    if (!form.qty)         { setFormError("Qty wajib diisi"); return; }
-    setFormError("");
-    const now = new Date();
-    try {
-      await addDoc(tradesCol, {
-        createdAt: now.toISOString(), date: now.toISOString().slice(0,10), time: now.toTimeString().slice(0,5),
-        pair: form.pair.toUpperCase().trim(), type: form.type, direction: form.direction, orderType: form.orderType,
-        orderPrice: parseFloat(form.orderPrice), qty: parseFloat(form.qty),
-        tp: form.tp ? parseFloat(form.tp) : null, sl: form.sl ? parseFloat(form.sl) : null,
-        status: form.status, pnl: form.pnl ? parseFloat(form.pnl) : null,
-        note: form.note, session: form.session,
-      });
-      setForm(EMPTY_FORM); setShowForm(false);
-    } catch (e) { setFormError("Gagal simpan. Cek koneksi internet."); }
+  const dayMap = useMemo(() => {
+    const m = {};
+    trades.forEach(t => {
+      if (!t.date) return;
+      if (!m[t.date]) m[t.date]={ wins:0, losses:0, pnl:0, trades:[] };
+      if (t.result==="Win")  m[t.date].wins++;
+      if (t.result==="Lose") m[t.date].losses++;
+      m[t.date].pnl+=(t.pnl||0);
+      m[t.date].trades.push(t);
+    });
+    return m;
+  }, [trades]);
+
+  // Handlers
+  const addTrade = () => {
+    if (!form.pair.trim()) { showToast("Pair wajib diisi!", "error"); return; }
+    const t = { ...form, id:uid(), pair:form.pair.toUpperCase().trim(), pnl:parseFloat(form.pnl)||0 };
+    setTrades(prev=>[...prev,t]);
+    setForm({ ...BLANK_FORM, date:today() });
+    showToast("Trade berhasil ditambahkan! ✓");
+    setTab("log");
+  };
+  const deleteTrade = id => {
+    if (!window.confirm("Hapus trade ini?")) return;
+    setTrades(prev=>prev.filter(t=>t.id!==id));
+    showToast("Trade dihapus.", "error");
+  };
+  const saveEdit = updated => {
+    setTrades(prev=>prev.map(t=>t.id===updated.id?updated:t));
+    setEditTrade(null); setDrawer(updated);
+    showToast("Trade diperbarui. ✓");
+  };
+  const resetAll = () => {
+    if (!window.confirm("Reset semua trade? Data tidak bisa dikembalikan.")) return;
+    setTrades([]); showToast("Data direset.", "error");
   };
 
-  const startEdit = (trade) => { setEditId(trade.id); setEditData({ ...trade }); };
-  const saveEdit = async () => {
-    try {
-      await updateDoc(doc(db, "trades", editId), {
-        pair: editData.pair, orderPrice: parseFloat(editData.orderPrice)||0, qty: parseFloat(editData.qty)||0,
-        tp: editData.tp ? parseFloat(editData.tp) : null, sl: editData.sl ? parseFloat(editData.sl) : null,
-        status: editData.status, pnl: editData.pnl !== "" && editData.pnl !== null ? parseFloat(editData.pnl) : null,
-        note: editData.note || "", session: editData.session || "Other",
-      });
-      setEditId(null);
-    } catch (e) { alert("Gagal update."); }
-  };
-  const deleteTrade = async (id) => { try { await deleteDoc(doc(db, "trades", id)); } catch(e) { alert("Gagal hapus."); } };
-
-  const navBtn = (id, label, icon) => (
-    <button onClick={() => setPage(id)} style={{
-      flex: 1, background: "none", border: "none", padding: "8px 0",
-      color: page === id ? "#6366f1" : "#475569", fontFamily: "inherit",
-      fontSize: 9, fontWeight: 700, cursor: "pointer", letterSpacing: 1,
-      borderTop: page === id ? "2px solid #6366f1" : "2px solid transparent",
-      display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
-    }}>
-      <span style={{ fontSize: 18 }}>{icon}</span>{label}
-    </button>
+  const SortTh = ({ col, label }) => (
+    <th style={{ ...thSt, cursor:"pointer", userSelect:"none" }} onClick={()=>toggleSort(col)}>
+      {label} {sortKey===col?(sortDir==="asc"?"↑":"↓"):<span style={{opacity:0.3}}>↕</span>}
+    </th>
   );
 
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
-    <div style={{ minHeight: "100vh", background: "#0a0a0f", color: "#e2e8f0", fontFamily: "'DM Mono','Fira Code',monospace", paddingBottom: 70 }}>
+    <div style={{ background:C.bg, minHeight:"100vh", fontFamily:"'DM Mono','Fira Code','Courier New',monospace", color:C.text }}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+      <style>{`
+        @keyframes slideIn { from{opacity:0;transform:translateX(16px)} to{opacity:1;transform:translateX(0)} }
+        @keyframes fadeUp  { from{opacity:0;transform:translateY(8px)}  to{opacity:1;transform:translateY(0)} }
+        input[type=date]::-webkit-calendar-picker-indicator,
+        input[type=time]::-webkit-calendar-picker-indicator { filter:invert(0.6); cursor:pointer; }
+        select option { background:#111d34; }
+        ::-webkit-scrollbar { width:5px; height:5px; }
+        ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.08); border-radius:4px; }
+        input:focus, select:focus, textarea:focus { border-color:rgba(0,214,143,0.4) !important; }
+        button:active { transform:scale(0.97); }
+        tr:hover td { background:rgba(255,255,255,0.02); }
+      `}</style>
+
+      {toast && <Toast msg={toast.msg} type={toast.type} />}
+      {showEqModal && <EquityModal current={initEquity} onSave={v=>{setInitEquity(v);setShowEqModal(false);showToast(`Initial equity → ${fmtUSD(v)} ✓`);}} onClose={()=>setShowEqModal(false)} />}
+      {drawer && !editTrade && <TradeDrawer trade={drawer} initEquity={initEquity} onClose={()=>setDrawer(null)} onDelete={deleteTrade} onEdit={t=>setEditTrade(t)} />}
+      {editTrade && <EditModal trade={editTrade} onSave={saveEdit} onClose={()=>setEditTrade(null)} />}
 
       {/* Header */}
-      <div style={{ background: "linear-gradient(135deg,#0f0f1a 0%,#12121f 100%)", borderBottom: "1px solid #1e1e35", padding: "20px 20px 14px", position: "sticky", top: 0, zIndex: 100 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <header style={{ background:C.card, borderBottom:`1px solid ${C.border}`, padding:"12px 24px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10, position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ width:34, height:34, borderRadius:8, background:"linear-gradient(135deg,#00d68f,#4f9cf9)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:17 }}>📈</div>
           <div>
-            <div style={{ fontSize: 11, color: "#6366f1", letterSpacing: 3, fontWeight: 700, marginBottom: 2 }}>◈ TRADING JOURNAL</div>
-            <div style={{ fontSize: 20, fontWeight: 800, letterSpacing: -1, color: "#f1f5f9" }}>Catatan Harian</div>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <div style={{ width: 7, height: 7, borderRadius: "50%", background: dbError ? "#f87171" : "#34d399", boxShadow: dbError ? "none" : "0 0 6px #34d399", animation: dbError ? "none" : "pulse 2s infinite" }} />
-              <span style={{ fontSize: 9, color: dbError ? "#f87171" : "#34d399", letterSpacing: 1 }}>{dbError ? "OFFLINE" : "LIVE"}</span>
-            </div>
-            {page === "journal" && (
-              <button onClick={() => { setShowForm(v => !v); setFormError(""); }} style={{ background: showForm ? "#1e1e35" : "linear-gradient(135deg,#6366f1,#8b5cf6)", border: "none", borderRadius: 12, padding: "9px 14px", color: showForm ? "#94a3b8" : "#fff", fontFamily: "inherit", fontWeight: 700, fontSize: 11, cursor: "pointer", letterSpacing: 1, boxShadow: showForm ? "none" : "0 4px 20px rgba(99,102,241,0.4)" }}>
-                {showForm ? "✕ Tutup" : "+ Order"}
-              </button>
-            )}
+            <div style={{ fontSize:14, fontWeight:700, color:C.textBright, letterSpacing:"0.3px" }}>TRADING JOURNAL</div>
+            <div style={{ fontSize:10, color:C.gray, letterSpacing:"1.2px", textTransform:"uppercase" }}>@wijdan_finance</div>
           </div>
         </div>
-        {dbError && <div style={{ marginTop: 10, padding: "8px 14px", background: "rgba(248,113,113,0.1)", border: "1px solid #7f1d1d", borderRadius: 8, fontSize: 12, color: "#f87171" }}>⚠ {dbError}</div>}
-      </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+          {/* Equity — clickable to edit */}
+          <button onClick={()=>setShowEqModal(true)} title="Klik untuk edit initial equity"
+            style={{ background:"rgba(0,214,143,0.1)", border:"1px solid rgba(0,214,143,0.25)", borderRadius:7, padding:"6px 14px", fontSize:12, color:C.green, fontWeight:700, letterSpacing:"0.4px", cursor:"pointer", display:"flex", alignItems:"center", gap:8, fontFamily:"inherit" }}>
+            <span style={{ fontSize:9, opacity:0.7, textTransform:"uppercase", letterSpacing:"1px" }}>Equity</span>
+            {fmtUSD(stats.equity)}
+            <span style={{ fontSize:9, background:"rgba(0,214,143,0.15)", border:"1px solid rgba(0,214,143,0.3)", borderRadius:3, padding:"1px 5px", letterSpacing:"0.5px" }}>EDIT</span>
+          </button>
+          <div style={{ fontSize:11, color:C.gray }}>Init: <span style={{ color:C.muted }}>{fmtUSD(initEquity)}</span></div>
+          <button style={{ ...btnSec, padding:"6px 12px", fontSize:11 }} onClick={resetAll}>Reset</button>
+        </div>
+      </header>
 
-      {/* JOURNAL PAGE */}
-      {page === "journal" && (
-        <>
-          {showForm && (
-            <div style={{ margin: "12px 16px 0", background: "#0f0f1a", border: "1px solid #2d2d4a", borderRadius: 16, padding: 18 }}>
-              <div style={{ fontSize: 11, color: "#6366f1", letterSpacing: 2, marginBottom: 16, fontWeight: 700 }}>✦ INPUT ORDER BARU</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
-                <div><label style={labelStyle}>PAIR *</label><input placeholder="cth: BTCUSDT" value={form.pair} onChange={e => fc("pair", e.target.value)} style={inputStyle} /></div>
-                <div><label style={labelStyle}>DIRECTION</label><select value={form.direction} onChange={e => fc("direction", e.target.value)} style={selectStyle}><option>Open Long</option><option>Open Short</option></select></div>
+      {/* Nav */}
+      <nav style={{ background:C.card, borderBottom:`1px solid ${C.border}`, padding:"0 24px", display:"flex", gap:2, overflowX:"auto" }}>
+        {[
+          { id:"dashboard", label:"Dashboard" },
+          { id:"log",       label:`Log (${trades.length})` },
+          { id:"add",       label:"+ Add" },
+          { id:"calendar",  label:"Calendar" },
+          { id:"stats",     label:"Analytics" },
+        ].map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)} style={{ padding:"12px 16px", background:"none", border:"none", cursor:"pointer", color:tab===t.id?C.green:C.gray, borderBottom:`2px solid ${tab===t.id?C.green:"transparent"}`, fontSize:11, fontWeight:500, letterSpacing:"0.8px", textTransform:"uppercase", transition:"all .15s", fontFamily:"inherit", whiteSpace:"nowrap" }}>
+            {t.label}
+          </button>
+        ))}
+      </nav>
+
+      {/* Content */}
+      <div style={{ padding:24 }}>
+
+        {/* ════ DASHBOARD ════ */}
+        {tab==="dashboard" && (
+          <div style={{ animation:"fadeUp .3s ease" }}>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:10, marginBottom:12 }}>
+              <MetricCard label="Total Trades"  value={stats.n}              sub={`${stats.wins}W / ${stats.losses}L / ${stats.be}BE`} />
+              <MetricCard label="Win Rate"       value={`${stats.wr}%`}      color={parseFloat(stats.wr)>=50?C.green:C.red} sub={`${stats.wins} wins`} accent={parseFloat(stats.wr)>=50?C.green:C.red} />
+              <MetricCard label="Total PnL"      value={fmtUSD(Math.abs(stats.totalPnl))} color={stats.totalPnl>=0?C.green:C.red} sub={`${stats.totalPnl>=0?"+":"-"}${pct(Math.abs(stats.totalPnl),initEquity)}`} accent={stats.totalPnl>=0?C.green:C.red} />
+              <MetricCard label="Current Equity" value={fmtUSD(stats.equity)} sub={`Init ${fmtUSD(initEquity)}`} onClick={()=>setShowEqModal(true)} />
+              <MetricCard label="Profit Factor"  value={stats.pf}             color={parseFloat(stats.pf)>=1?C.green:C.red} />
+              <MetricCard label="Risk : Reward"  value={`1 : ${stats.rr}`} />
+              <MetricCard label="Max Drawdown"   value={fmtUSD(stats.maxDD)} color={C.red} sub={`${stats.maxDDPct}% of equity`} />
+              <MetricCard label="Streak"         value={`${stats.streak}×`}  color={stats.streakType==="Win"?C.green:stats.streakType==="Lose"?C.red:C.gray} sub={stats.streakType} />
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr", gap:12, marginBottom:12 }}>
+              <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"16px 18px" }}>
+                <div style={{ fontSize:10, color:C.muted, letterSpacing:"1px", textTransform:"uppercase", marginBottom:12 }}>Equity Curve</div>
+                <ResponsiveContainer width="100%" height={200}>
+                  <LineChart data={equityCurve}>
+                    <defs>
+                      <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%"  stopColor="#00d68f" stopOpacity={0.18}/>
+                        <stop offset="95%" stopColor="#00d68f" stopOpacity={0}/>
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                    <XAxis dataKey="name" tick={{ fontSize:10, fill:C.gray }} />
+                    <YAxis tick={{ fontSize:10, fill:C.gray }} tickFormatter={v=>"$"+v.toLocaleString()} width={72} />
+                    <Tooltip content={<ChartTip />} />
+                    <ReferenceLine y={initEquity} stroke={C.gray} strokeDasharray="4 4" />
+                    <Line type="monotone" dataKey="equity" stroke={C.green} strokeWidth={2} fill="url(#eqGrad)" dot={{ r:3, fill:C.green, strokeWidth:0 }} activeDot={{ r:5 }} name="Equity" />
+                  </LineChart>
+                </ResponsiveContainer>
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
-                <div><label style={labelStyle}>ENTRY PRICE *</label><input placeholder="0.00" type="number" value={form.orderPrice} onChange={e => fc("orderPrice", e.target.value)} style={inputStyle} /></div>
-                <div><label style={labelStyle}>QTY *</label><input placeholder="0" type="number" value={form.qty} onChange={e => fc("qty", e.target.value)} style={inputStyle} /></div>
+              <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"16px 18px" }}>
+                <div style={{ fontSize:10, color:C.muted, letterSpacing:"1px", textTransform:"uppercase", marginBottom:12 }}>Win / Lose</div>
+                <ResponsiveContainer width="100%" height={200}>
+                  <PieChart>
+                    <Pie data={winLosePie} cx="50%" cy="50%" innerRadius={52} outerRadius={76} dataKey="value" paddingAngle={4} label={({name,percent})=>`${name} ${(percent*100).toFixed(0)}%`} labelLine={false}>
+                      {winLosePie.map((d,i)=><Cell key={i} fill={d.color} />)}
+                    </Pie>
+                    <Tooltip content={<ChartTip />} />
+                  </PieChart>
+                </ResponsiveContainer>
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
-                <div><label style={labelStyle}>TAKE PROFIT</label><input placeholder="0.00" type="number" value={form.tp} onChange={e => fc("tp", e.target.value)} style={{ ...inputStyle, color: "#34d399" }} /></div>
-                <div><label style={labelStyle}>STOP LOSS</label><input placeholder="0.00" type="number" value={form.sl} onChange={e => fc("sl", e.target.value)} style={{ ...inputStyle, color: "#f87171" }} /></div>
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:"3fr 2fr", gap:12 }}>
+              <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"16px 18px" }}>
+                <div style={{ fontSize:10, color:C.muted, letterSpacing:"1px", textTransform:"uppercase", marginBottom:12 }}>PnL per Trade (last 30)</div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={pnlBars} barCategoryGap="18%">
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                    <XAxis dataKey="name" tick={{ fontSize:9, fill:C.gray }} />
+                    <YAxis tick={{ fontSize:9, fill:C.gray }} tickFormatter={v=>"$"+v} width={55} />
+                    <Tooltip content={<ChartTip />} />
+                    <ReferenceLine y={0} stroke={C.gray} strokeDasharray="4 4" />
+                    <Bar dataKey="pnl" name="PnL" radius={[3,3,0,0]}>
+                      {pnlBars.map((d,i)=><Cell key={i} fill={d.pnl>=0?C.green:C.red} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
-              <div style={{ marginBottom: 10 }}>
-                <label style={labelStyle}>SESSION</label>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6 }}>
-                  {SESSIONS.map(s => (
-                    <button key={s.id} onClick={() => fc("session", s.id)} style={{ background: form.session === s.id ? `${s.color}20` : "#0a0a0f", border: `1px solid ${form.session === s.id ? s.color : "#1e1e35"}`, borderRadius: 8, padding: "8px 4px", cursor: "pointer", textAlign: "center" }}>
-                      <div style={{ fontSize: 14 }}>{s.icon}</div>
-                      <div style={{ fontSize: 9, color: form.session === s.id ? s.color : "#475569", fontWeight: 700, marginTop: 2 }}>{s.label}</div>
-                      {s.hours && <div style={{ fontSize: 8, color: "#334155", marginTop: 1 }}>{s.hours}</div>}
-                    </button>
-                  ))}
+              <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"16px 18px" }}>
+                <div style={{ fontSize:10, color:C.muted, letterSpacing:"1px", textTransform:"uppercase", marginBottom:12 }}>Net PnL by Pair</div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={pairBars} layout="vertical" barCategoryGap="20%">
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.border} horizontal={false} />
+                    <XAxis type="number" tick={{ fontSize:9, fill:C.gray }} tickFormatter={v=>"$"+v} />
+                    <YAxis type="category" dataKey="pair" tick={{ fontSize:9, fill:C.gray }} width={55} />
+                    <Tooltip content={<ChartTip />} />
+                    <Bar dataKey="pnl" name="Net PnL" radius={[0,3,3,0]}>
+                      {pairBars.map((d,i)=><Cell key={i} fill={d.pnl>=0?C.green:C.red} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ════ TRADE LOG ════ */}
+        {tab==="log" && (
+          <div style={{ animation:"fadeUp .3s ease" }}>
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:12, alignItems:"center" }}>
+              {[
+                { val:filterPair,     set:setFilterPair,     opts:["","..."],             labels:["All Pairs","All Pairs",...pairs],                       extra:pairs },
+                { val:filterResult,   set:setFilterResult,   opts:["","Win","Lose","Break Even"], labels:["All Results","Win","Lose","Break Even"] },
+                { val:filterPosition, set:setFilterPosition, opts:["","Long","Short"],    labels:["All Positions","Long","Short"] },
+              ].map((f,i)=>{
+                const opts = i===0 ? ["", ...pairs] : f.opts;
+                const labels = i===0 ? ["All Pairs", ...pairs] : f.labels;
+                return (
+                  <select key={i} value={f.val} onChange={e=>f.set(e.target.value)} style={{ ...inputSt, width:"auto", fontSize:11 }}>
+                    {opts.map((o,j)=><option key={j} value={o}>{labels[j]}</option>)}
+                  </select>
+                );
+              })}
+              <span style={{ fontSize:11, color:C.gray, marginLeft:"auto" }}>{filteredTrades.length} trades</span>
+            </div>
+
+            {filteredTrades.length===0 ? (
+              <div style={{ textAlign:"center", padding:"4rem", color:C.gray, fontSize:13 }}>Tidak ada trade yang cocok.</div>
+            ) : (
+              <div style={{ overflowX:"auto", borderRadius:10, border:`1px solid ${C.border}` }}>
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, minWidth:700 }}>
+                  <thead>
+                    <tr>
+                      <SortTh col="date"  label="Date" />
+                      <th style={thSt}>Pair</th>
+                      <th style={thSt}>Pos</th>
+                      <th style={thSt}>TF</th>
+                      <th style={thSt}>Playbook</th>
+                      <SortTh col="pnl" label="PnL" />
+                      <th style={thSt}>% Gain</th>
+                      <th style={thSt}>Equity</th>
+                      <th style={thSt}>Result</th>
+                      <th style={thSt}></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredTrades.map(t => {
+                      const gainPct = ((t.pnl/initEquity)*100).toFixed(2);
+                      return (
+                        <tr key={t.id} style={{ cursor:"pointer" }} onClick={()=>setDrawer(t)}>
+                          <td style={{ ...tdSt, color:C.muted }}>{t.date||"—"}</td>
+                          <td style={{ ...tdSt, fontWeight:700, color:C.textBright }}>{t.pair}</td>
+                          <td style={tdSt}><Badge type={t.position} /></td>
+                          <td style={{ ...tdSt, color:C.muted }}>{t.tf}</td>
+                          <td style={{ ...tdSt, color:C.muted, fontSize:11 }}>{t.playbook||"—"}</td>
+                          <td style={{ ...tdSt, fontWeight:700, color:t.pnl>=0?C.green:C.red }}>{fmtUSD(t.pnl,true)}</td>
+                          <td style={{ ...tdSt, color:t.pnl>=0?C.green:C.red }}>{t.pnl>=0?"+":""}{gainPct}%</td>
+                          <td style={tdSt}>{fmtUSD(equityMap[t.id]||0)}</td>
+                          <td style={tdSt}><Badge type={t.result} /></td>
+                          <td style={tdSt} onClick={e=>e.stopPropagation()}>
+                            <button style={{ background:"none", border:"none", cursor:"pointer", color:C.gray, fontSize:14, padding:"2px 6px" }} onClick={()=>deleteTrade(t.id)} title="Hapus">🗑</button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ════ ADD TRADE ════ */}
+        {tab==="add" && (
+          <div style={{ maxWidth:680, animation:"fadeUp .3s ease" }}>
+            <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:24 }}>
+              <div style={{ fontSize:14, fontWeight:700, color:C.textBright, marginBottom:20, display:"flex", alignItems:"center", gap:8 }}>
+                <span style={{ fontSize:18 }}>📝</span> Tambah Trade Baru
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(155px,1fr))", gap:12, marginBottom:14 }}>
+                <FormField label="Date"><input type="date" style={inputSt} value={form.date} onChange={e=>setForm(p=>({...p,date:e.target.value}))} /></FormField>
+                <FormField label="Session"><select style={inputSt} value={form.session} onChange={e=>setForm(p=>({...p,session:e.target.value}))}>{SESSIONS.map(s=><option key={s}>{s}</option>)}</select></FormField>
+                <FormField label="Entry Time"><input type="time" style={inputSt} value={form.time} onChange={e=>setForm(p=>({...p,time:e.target.value}))} /></FormField>
+                <FormField label="Pair / Instrument"><input type="text" style={inputSt} placeholder="e.g. XAUUSD" value={form.pair} onChange={e=>setForm(p=>({...p,pair:e.target.value}))} /></FormField>
+                <FormField label="Trend"><select style={inputSt} value={form.trend} onChange={e=>setForm(p=>({...p,trend:e.target.value}))}>{TRENDS.map(t=><option key={t}>{t}</option>)}</select></FormField>
+                <FormField label="Position"><select style={inputSt} value={form.position} onChange={e=>setForm(p=>({...p,position:e.target.value}))}>{POSITIONS.map(t=><option key={t}>{t}</option>)}</select></FormField>
+                <FormField label="Timeframe"><select style={inputSt} value={form.tf} onChange={e=>setForm(p=>({...p,tf:e.target.value}))}>{TIMEFRAMES.map(t=><option key={t}>{t}</option>)}</select></FormField>
+                <FormField label="Playbook / Setup"><input type="text" style={inputSt} placeholder="e.g. OB Retest, BOS" value={form.playbook} onChange={e=>setForm(p=>({...p,playbook:e.target.value}))} /></FormField>
+                <FormField label="Duration"><input type="text" style={inputSt} placeholder="e.g. 2h 30m" value={form.duration} onChange={e=>setForm(p=>({...p,duration:e.target.value}))} /></FormField>
+                <FormField label="PnL ($)">
+                  <input type="number" style={{ ...inputSt, color:parseFloat(form.pnl)>=0?C.green:C.red, fontWeight:700 }} placeholder="0.00" step="0.01" value={form.pnl} onChange={e=>setForm(p=>({...p,pnl:e.target.value}))} />
+                </FormField>
+                <FormField label="Result"><select style={inputSt} value={form.result} onChange={e=>setForm(p=>({...p,result:e.target.value}))}>{RESULTS.map(r=><option key={r}>{r}</option>)}</select></FormField>
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
+                <FormField label="Trade Plan"><textarea style={{ ...inputSt, minHeight:80, resize:"vertical" }} placeholder="Rencana sebelum entry..." value={form.plan} onChange={e=>setForm(p=>({...p,plan:e.target.value}))} /></FormField>
+                <FormField label="Evaluasi"><textarea style={{ ...inputSt, minHeight:80, resize:"vertical" }} placeholder="Apa yang terjadi?" value={form.evalNote} onChange={e=>setForm(p=>({...p,evalNote:e.target.value}))} /></FormField>
+              </div>
+              {/* Preview */}
+              {form.pair && (
+                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:10, padding:"10px 14px", marginBottom:16, fontSize:12, display:"flex", gap:12, flexWrap:"wrap", alignItems:"center" }}>
+                  <span style={{ color:C.textBright, fontWeight:700 }}>{form.pair.toUpperCase()}</span>
+                  <Badge type={form.position} />
+                  <span style={{ color:C.muted }}>{form.tf} · {form.session}</span>
+                  <span style={{ color:parseFloat(form.pnl)>=0?C.green:C.red, fontWeight:700, marginLeft:"auto" }}>{fmtUSD(parseFloat(form.pnl)||0,true)}</span>
+                  <Badge type={form.result} />
                 </div>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
-                <div><label style={labelStyle}>ORDER TYPE</label><select value={form.orderType} onChange={e => fc("orderType", e.target.value)} style={selectStyle}><option>Limit</option><option>Market</option></select></div>
-                <div><label style={labelStyle}>STATUS</label><select value={form.status} onChange={e => fc("status", e.target.value)} style={selectStyle}>{["Pending","Filled","TP Hit","SL Hit","Cancelled"].map(s => <option key={s}>{s}</option>)}</select></div>
-              </div>
-              {(form.status === "TP Hit" || form.status === "SL Hit") && (
-                <div style={{ marginBottom: 10 }}><label style={labelStyle}>PnL (USDT)</label><input placeholder="cth: -10.50" type="number" value={form.pnl} onChange={e => fc("pnl", e.target.value)} style={{ ...inputStyle, color: parseFloat(form.pnl) < 0 ? "#f87171" : "#34d399" }} /></div>
               )}
-              <div style={{ marginBottom: 14 }}><label style={labelStyle}>CATATAN</label><textarea placeholder="Setup, alasan entry, dll..." value={form.note} onChange={e => fc("note", e.target.value)} rows={2} style={{ ...inputStyle, resize: "none" }} /></div>
-              {form.orderPrice && form.tp && form.sl && (
-                <div style={{ marginBottom: 14, padding: "8px 12px", background: "#12121f", borderRadius: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 11, color: "#475569" }}>Preview R:R</span>
-                  <RRBadge tp={parseFloat(form.tp)} sl={parseFloat(form.sl)} price={parseFloat(form.orderPrice)} />
-                </div>
-              )}
-              {formError && <div style={{ marginBottom: 10, fontSize: 12, color: "#f87171" }}>⚠ {formError}</div>}
-              <button onClick={handleAddTrade} style={{ width: "100%", background: "linear-gradient(135deg,#6366f1,#8b5cf6)", border: "none", borderRadius: 10, padding: "12px", color: "#fff", fontFamily: "inherit", fontWeight: 800, fontSize: 13, cursor: "pointer", letterSpacing: 1, boxShadow: "0 4px 20px rgba(99,102,241,0.3)" }}>✦ SIMPAN ORDER</button>
-            </div>
-          )}
-
-          {/* Date Filter */}
-          <div style={{ display: "flex", gap: 6, padding: "14px 16px 0", overflowX: "auto" }}>
-            {DATE_FILTERS.map(f => (
-              <button key={f} onClick={() => setDateFilter(f)} style={{ background: dateFilter === f ? "rgba(99,102,241,0.2)" : "#12121f", border: `1px solid ${dateFilter === f ? "#6366f1" : "#1e1e35"}`, borderRadius: 20, padding: "4px 12px", color: dateFilter === f ? "#a5b4fc" : "#64748b", fontFamily: "inherit", fontSize: 10, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>{f}</button>
-            ))}
-          </div>
-
-          {/* Session Filter */}
-          <div style={{ display: "flex", gap: 6, padding: "8px 16px 0", overflowX: "auto" }}>
-            <button onClick={() => setSessionFilter("All")} style={{ background: sessionFilter === "All" ? "rgba(99,102,241,0.2)" : "#12121f", border: `1px solid ${sessionFilter === "All" ? "#6366f1" : "#1e1e35"}`, borderRadius: 20, padding: "4px 12px", color: sessionFilter === "All" ? "#a5b4fc" : "#64748b", fontFamily: "inherit", fontSize: 10, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>🌐 Semua</button>
-            {SESSIONS.map(s => (
-              <button key={s.id} onClick={() => setSessionFilter(s.id)} style={{ background: sessionFilter === s.id ? `${s.color}20` : "#12121f", border: `1px solid ${sessionFilter === s.id ? s.color : "#1e1e35"}`, borderRadius: 20, padding: "4px 12px", color: sessionFilter === s.id ? s.color : "#64748b", fontFamily: "inherit", fontSize: 10, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>{s.icon} {s.label}</button>
-            ))}
-          </div>
-
-          {/* Stats */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8, padding: "10px 16px 0" }}>
-            {[{ label:"Total",value:stats.total,color:"#a78bfa"},{ label:"Pending",value:stats.pending,color:"#fbbf24"},{ label:"TP Hit",value:stats.tp,color:"#34d399"},{ label:"SL Hit",value:stats.sl,color:"#f87171"}].map(s => (
-              <div key={s.label} style={{ background:"#12121f",border:"1px solid #1e1e35",borderRadius:12,padding:"10px 8px",textAlign:"center" }}>
-                <div style={{ fontSize:18,fontWeight:800,color:s.color }}>{s.value}</div>
-                <div style={{ fontSize:9,color:"#64748b",letterSpacing:1 }}>{s.label}</div>
-              </div>
-            ))}
-          </div>
-
-          {/* Win Rate + PnL */}
-          <div style={{ padding:"8px 16px 0",display:"grid",gridTemplateColumns:"1fr 1fr",gap:8 }}>
-            <div style={{ background:"#0f0f1a",border:"1px solid #1e1e35",borderRadius:14,padding:"14px 16px" }}>
-              <div style={{ fontSize:10,color:"#475569",letterSpacing:2,marginBottom:4 }}>WIN RATE</div>
-              {stats.winRate !== null ? (
-                <>
-                  <div style={{ fontSize:26,fontWeight:900,lineHeight:1,marginBottom:6,color:parseFloat(stats.winRate)>=50?"#34d399":"#f87171" }}>{stats.winRate}%</div>
-                  <div style={{ fontSize:10,color:"#475569" }}>{stats.tp}W / {stats.sl}L</div>
-                  <div style={{ marginTop:8,height:4,background:"#1e1e35",borderRadius:4,overflow:"hidden" }}>
-                    <div style={{ height:"100%",width:`${stats.winRate}%`,background:parseFloat(stats.winRate)>=50?"linear-gradient(90deg,#34d399,#6ee7b7)":"linear-gradient(90deg,#f87171,#fca5a5)",borderRadius:4,transition:"width 0.6s ease" }} />
-                  </div>
-                </>
-              ) : <div style={{ fontSize:12,color:"#334155",marginTop:4 }}>Belum ada closed</div>}
-            </div>
-            <div style={{ background:"#0f0f1a",border:"1px solid #1e1e35",borderRadius:14,padding:"14px 16px" }}>
-              <div style={{ fontSize:10,color:"#475569",letterSpacing:2,marginBottom:4 }}>NET P/L</div>
-              <div style={{ fontSize:20,fontWeight:900,lineHeight:1,marginBottom:6,color:pnlColor(stats.totalPnl) }}>
-                {stats.totalPnl>=0?"+":""}{stats.totalPnl.toFixed(2)}<span style={{ fontSize:10,color:"#475569",fontWeight:400,marginLeft:4 }}>USDT</span>
-              </div>
-              <div style={{ display:"flex",flexDirection:"column",gap:3 }}>
-                <div style={{ display:"flex",justifyContent:"space-between",fontSize:10 }}><span style={{ color:"#475569" }}>Profit</span><span style={{ color:"#34d399",fontWeight:700 }}>+{stats.totalProfit.toFixed(2)}</span></div>
-                <div style={{ display:"flex",justifyContent:"space-between",fontSize:10 }}><span style={{ color:"#475569" }}>Loss</span><span style={{ color:"#f87171",fontWeight:700 }}>{stats.totalLoss.toFixed(2)}</span></div>
-              </div>
+              <button style={btnPri} onClick={addTrade}>SIMPAN TRADE</button>
             </div>
           </div>
+        )}
 
-          {/* Status Filter */}
-          <div style={{ display:"flex",gap:6,padding:"12px 16px 8px",overflowX:"auto" }}>
-            {["All","Pending","Filled","TP Hit","SL Hit","Cancelled"].map(f => (
-              <button key={f} onClick={() => setStatusFilter(f)} style={{ background:statusFilter===f?"#6366f1":"#12121f",border:`1px solid ${statusFilter===f?"#6366f1":"#1e1e35"}`,borderRadius:20,padding:"4px 12px",color:statusFilter===f?"#fff":"#64748b",fontFamily:"inherit",fontSize:10,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap" }}>{f}</button>
-            ))}
-          </div>
-
-          {loading && <div style={{ textAlign:"center",color:"#475569",padding:"40px 0",fontSize:13 }}>⏳ Memuat data...</div>}
-
-          {!loading && (
-            <div style={{ padding:"0 16px",display:"flex",flexDirection:"column",gap:10 }}>
-              {filteredTrades.length === 0 && <div style={{ textAlign:"center",color:"#334155",padding:"40px 0",fontSize:13 }}>Tidak ada trade di periode ini.</div>}
-              {filteredTrades.map(trade => (
-                <div key={trade.id} style={{ background:"#0f0f1a",border:"1px solid #1e1e35",borderRadius:14,overflow:"hidden" }}>
-                  {editId === trade.id ? (
-                    <div style={{ padding:16 }}>
-                      <div style={{ fontSize:11,color:"#6366f1",marginBottom:12,letterSpacing:2 }}>EDIT ORDER</div>
-                      <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8 }}>
-                        {[["pair","Pair"],["orderPrice","Entry Price"],["qty","Qty"],["tp","Take Profit"],["sl","Stop Loss"],["pnl","PnL (USDT)"]].map(([k,label]) => (
-                          <div key={k}><div style={{ fontSize:10,color:"#475569",marginBottom:4 }}>{label}</div><input value={editData[k]??""} onChange={e => setEditData(d=>({...d,[k]:e.target.value}))} style={inputStyle} /></div>
-                        ))}
+        {/* ════ CALENDAR ════ */}
+        {tab==="calendar" && (
+          <div style={{ maxWidth:520, animation:"fadeUp .3s ease" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+              <button style={{ ...btnSec, padding:"6px 14px" }} onClick={()=>{let m=calMonth-1,y=calYear;if(m<0){m=11;y--;}setCalMonth(m);setCalYear(y);setCalDetail(null);}}>‹</button>
+              <span style={{ fontSize:14, fontWeight:700, color:C.textBright, letterSpacing:"1px" }}>{MONTHS_ID[calMonth].toUpperCase()} {calYear}</span>
+              <button style={{ ...btnSec, padding:"6px 14px" }} onClick={()=>{let m=calMonth+1,y=calYear;if(m>11){m=0;y++;}setCalMonth(m);setCalYear(y);setCalDetail(null);}}>›</button>
+            </div>
+            <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:16, marginBottom:10 }}>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", gap:4 }}>
+                {DAYS_ID.map(d=><div key={d} style={{ fontSize:10, color:C.gray, textAlign:"center", padding:"4px 0", letterSpacing:"0.4px" }}>{d}</div>)}
+                {(() => {
+                  const first=new Date(calYear,calMonth,1), last=new Date(calYear,calMonth+1,0);
+                  const cells=[];
+                  for(let i=0;i<first.getDay();i++) cells.push(<div key={"e"+i} />);
+                  for(let d=1;d<=last.getDate();d++){
+                    const key=`${calYear}-${String(calMonth+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+                    const info=dayMap[key];
+                    const type=info?(info.pnl>0?"win":info.pnl<0?"lose":"be"):"none";
+                    const bg={win:C.green,lose:C.red,be:C.gray,none:C.surface}[type];
+                    const fg={win:"#fff",lose:"#fff",be:"#fff",none:C.gray}[type];
+                    cells.push(
+                      <div key={key} onClick={()=>setCalDetail(info?{key,...info}:null)} title={info?`${info.trades.length} trade | ${fmtUSD(info.pnl,true)}`:"No trade"}
+                        style={{ aspectRatio:"1", borderRadius:6, display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:500, cursor:info?"pointer":"default", background:bg, color:fg, border:`1px solid rgba(255,255,255,0.04)`, transition:"transform .12s" }}
+                        onMouseEnter={e=>{if(info)e.currentTarget.style.transform="scale(1.12)";}}
+                        onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
+                        {d}
                       </div>
-                      <div style={{ marginTop:8 }}>
-                        <div style={{ fontSize:10,color:"#475569",marginBottom:4 }}>Session</div>
-                        <div style={{ display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6 }}>
-                          {SESSIONS.map(s => (
-                            <button key={s.id} onClick={() => setEditData(d=>({...d,session:s.id}))} style={{ background:editData.session===s.id?`${s.color}20`:"#0a0a0f",border:`1px solid ${editData.session===s.id?s.color:"#1e1e35"}`,borderRadius:8,padding:"6px 4px",cursor:"pointer",textAlign:"center" }}>
-                              <div style={{ fontSize:12 }}>{s.icon}</div>
-                              <div style={{ fontSize:8,color:editData.session===s.id?s.color:"#475569",fontWeight:700 }}>{s.label}</div>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                      <div style={{ marginTop:8 }}><div style={{ fontSize:10,color:"#475569",marginBottom:4 }}>Status</div><select value={editData.status} onChange={e=>setEditData(d=>({...d,status:e.target.value}))} style={selectStyle}>{["Pending","Filled","TP Hit","SL Hit","Cancelled"].map(s=><option key={s}>{s}</option>)}</select></div>
-                      <div style={{ marginTop:8 }}><div style={{ fontSize:10,color:"#475569",marginBottom:4 }}>Catatan</div><textarea value={editData.note||""} onChange={e=>setEditData(d=>({...d,note:e.target.value}))} rows={2} style={{ ...inputStyle,resize:"none" }} /></div>
-                      <div style={{ display:"flex",gap:8,marginTop:12 }}>
-                        <button onClick={saveEdit} style={{ flex:1,background:"#6366f1",border:"none",borderRadius:8,padding:"10px",color:"#fff",fontFamily:"inherit",fontWeight:700,fontSize:12,cursor:"pointer" }}>Simpan</button>
-                        <button onClick={()=>setEditId(null)} style={{ flex:1,background:"#1e1e35",border:"none",borderRadius:8,padding:"10px",color:"#94a3b8",fontFamily:"inherit",fontWeight:700,fontSize:12,cursor:"pointer" }}>Batal</button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div onClick={()=>setExpandedId(expandedId===trade.id?null:trade.id)} style={{ cursor:"pointer" }}>
-                      <div style={{ padding:"14px 16px 10px" }}>
-                        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8 }}>
-                          <div>
-                            <span style={{ fontSize:16,fontWeight:800,color:"#f1f5f9",letterSpacing:-0.5 }}>{trade.pair}</span>
-                            <span style={{ fontSize:10,color:"#475569",marginLeft:8 }}>{trade.date} {trade.time}</span>
-                          </div>
-                          <StatusBadge status={trade.status} />
-                        </div>
-                        {trade.session && <div style={{ marginBottom:6 }}><SessionBadge session={trade.session} /></div>}
-                        <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:4 }}>
-                          <div><div style={{ fontSize:9,color:"#475569",letterSpacing:1 }}>ENTRY</div><div style={{ fontSize:14,fontWeight:700,color:"#e2e8f0" }}>{trade.orderPrice}</div></div>
-                          <div><div style={{ fontSize:9,color:"#475569",letterSpacing:1 }}>TP / SL</div><div style={{ fontSize:12 }}><span style={{ color:"#34d399",fontWeight:700 }}>{trade.tp??"—"}</span><span style={{ color:"#475569" }}> / </span><span style={{ color:"#f87171",fontWeight:700 }}>{trade.sl??"—"}</span></div></div>
-                          <div style={{ textAlign:"right" }}>
-                            {trade.pnl!==null&&trade.pnl!==undefined?(
-                              <><div style={{ fontSize:9,color:"#475569",letterSpacing:1 }}>PnL</div><div style={{ fontSize:14,fontWeight:800,color:pnlColor(trade.pnl) }}>{trade.pnl>=0?"+":""}{trade.pnl} USDT</div></>
-                            ):<RRBadge tp={trade.tp} sl={trade.sl} price={trade.orderPrice} />}
-                          </div>
-                        </div>
-                        {expandedId===trade.id&&(
-                          <div style={{ marginTop:12,paddingTop:12,borderTop:"1px solid #1e1e35" }}>
-                            <div style={{ display:"flex",gap:6,flexWrap:"wrap",marginBottom:8 }}>
-                              <span style={{ fontSize:11,color:"#6366f1",background:"rgba(99,102,241,0.1)",padding:"2px 8px",borderRadius:6 }}>{trade.type}</span>
-                              <span style={{ fontSize:11,color:"#60a5fa",background:"rgba(96,165,250,0.1)",padding:"2px 8px",borderRadius:6 }}>{trade.direction}</span>
-                              <span style={{ fontSize:11,color:"#94a3b8",background:"#12121f",padding:"2px 8px",borderRadius:6 }}>Qty: {trade.qty}</span>
-                              <span style={{ fontSize:11,color:"#94a3b8",background:"#12121f",padding:"2px 8px",borderRadius:6 }}>{trade.orderType}</span>
-                            </div>
-                            {trade.note&&<div style={{ fontSize:12,color:"#64748b",fontStyle:"italic",marginBottom:8 }}>"{trade.note}"</div>}
-                            <div style={{ display:"flex",gap:8 }}>
-                              <button onClick={e=>{e.stopPropagation();startEdit(trade);}} style={{ flex:1,background:"#1e1e35",border:"none",borderRadius:8,padding:"8px",color:"#a78bfa",fontFamily:"inherit",fontSize:11,fontWeight:700,cursor:"pointer" }}>✏️ Edit</button>
-                              <button onClick={e=>{e.stopPropagation();deleteTrade(trade.id);}} style={{ background:"#1e1e35",border:"none",borderRadius:8,padding:"8px 14px",color:"#f87171",fontFamily:"inherit",fontSize:11,fontWeight:700,cursor:"pointer" }}>✕</button>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
+                    );
+                  }
+                  return cells;
+                })()}
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:14, marginBottom:12, flexWrap:"wrap" }}>
+              {[{c:C.green,l:"Profit"},{c:C.red,l:"Loss"},{c:C.gray,l:"Break Even"},{c:C.surface,l:"No Trade",b:`1px solid ${C.border}`}].map((x,i)=>(
+                <div key={i} style={{ display:"flex", alignItems:"center", gap:5, fontSize:10, color:C.gray }}>
+                  <div style={{ width:10, height:10, borderRadius:2, background:x.c, border:x.b }} />{x.l}
                 </div>
               ))}
             </div>
-          )}
-        </>
-      )}
+            {calDetail && (
+              <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:16, animation:"fadeUp .2s ease" }}>
+                <div style={{ fontSize:11, color:C.muted, marginBottom:10, letterSpacing:"0.6px", textTransform:"uppercase" }}>
+                  {calDetail.key} · {calDetail.trades.length} trade(s) · <span style={{ color:calDetail.pnl>=0?C.green:C.red }}>{fmtUSD(calDetail.pnl,true)}</span>
+                </div>
+                {calDetail.trades.map(t=>(
+                  <div key={t.id} onClick={()=>{setDrawer(t);setCalDetail(null);}} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:`1px solid ${C.border}`, fontSize:12, cursor:"pointer" }}>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <span style={{ fontWeight:700, color:C.textBright }}>{t.pair}</span>
+                      <Badge type={t.position} /><span style={{ color:C.muted }}>{t.tf}</span>
+                    </div>
+                    <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                      <span style={{ fontWeight:700, color:t.pnl>=0?C.green:C.red }}>{fmtUSD(t.pnl,true)}</span>
+                      <Badge type={t.result} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
-      {page === "calendar" && <CalendarPage trades={trades} pnlColor={pnlColor} />}
-      {page === "stats"    && <StatisticsPage trades={trades} pnlColor={pnlColor} />}
+        {/* ════ ANALYTICS ════ */}
+        {tab==="stats" && (
+          <div style={{ animation:"fadeUp .3s ease" }}>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))", gap:12, marginBottom:16 }}>
+              <MetricCard label="Best Trade"   value={fmtUSD(stats.bestTrade,  true)} color={C.green} />
+              <MetricCard label="Worst Trade"  value={fmtUSD(stats.worstTrade, true)} color={C.red}   />
+              <MetricCard label="Avg Win"      value={`+${fmtUSD(stats.avgWin)}`}     color={C.green} />
+              <MetricCard label="Avg Loss"     value={`-${fmtUSD(stats.avgLoss)}`}    color={C.red}   />
+              <MetricCard label="Max Drawdown" value={fmtUSD(stats.maxDD)}            color={C.red}   sub={`${stats.maxDDPct}% of equity`} />
+              <MetricCard label="Profit Factor" value={stats.pf}                      color={parseFloat(stats.pf)>=1?C.green:C.red} />
+            </div>
 
-      {/* Bottom Nav */}
-      <div style={{ position:"fixed",bottom:0,left:0,right:0,background:"#0f0f1a",borderTop:"1px solid #1e1e35",display:"flex",zIndex:100 }}>
-        {navBtn("journal","JURNAL","📋")}
-        {navBtn("calendar","KALENDER","📅")}
-        {navBtn("stats","STATISTIK","📊")}
+            {/* Playbook breakdown */}
+            {(() => {
+              const map = {};
+              trades.forEach(t => {
+                const k=t.playbook||"No Playbook";
+                if(!map[k]) map[k]={name:k,wins:0,losses:0,pnl:0};
+                if(t.result==="Win") map[k].wins++;
+                else if(t.result==="Lose") map[k].losses++;
+                map[k].pnl+=(t.pnl||0);
+              });
+              const rows=Object.values(map).sort((a,b)=>b.pnl-a.pnl);
+              return (
+                <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 20px", marginBottom:12 }}>
+                  <div style={{ fontSize:10, color:C.muted, letterSpacing:"1px", textTransform:"uppercase", marginBottom:14 }}>Playbook Breakdown</div>
+                  <div style={{ overflowX:"auto" }}>
+                    <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                      <thead><tr>{["Playbook","Trades","Wins","Losses","Win Rate","Net PnL"].map(h=><th key={h} style={thSt}>{h}</th>)}</tr></thead>
+                      <tbody>{rows.map(r=>(
+                        <tr key={r.name}>
+                          <td style={{ ...tdSt, fontWeight:600, color:C.textBright }}>{r.name}</td>
+                          <td style={tdSt}>{r.wins+r.losses}</td>
+                          <td style={{ ...tdSt, color:C.green }}>{r.wins}</td>
+                          <td style={{ ...tdSt, color:C.red }}>{r.losses}</td>
+                          <td style={{ ...tdSt, color:(r.wins/(r.wins+r.losses||1)*100)>=50?C.green:C.red }}>{(r.wins/(r.wins+r.losses||1)*100).toFixed(0)}%</td>
+                          <td style={{ ...tdSt, fontWeight:700, color:r.pnl>=0?C.green:C.red }}>{fmtUSD(r.pnl,true)}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Session breakdown */}
+            {(() => {
+              const map = {};
+              trades.forEach(t => {
+                const k=t.session||"Unknown";
+                if(!map[k]) map[k]={name:k,wins:0,losses:0,pnl:0};
+                if(t.result==="Win") map[k].wins++;
+                else if(t.result==="Lose") map[k].losses++;
+                map[k].pnl+=(t.pnl||0);
+              });
+              const rows=Object.values(map).sort((a,b)=>b.pnl-a.pnl);
+              return (
+                <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"18px 20px" }}>
+                  <div style={{ fontSize:10, color:C.muted, letterSpacing:"1px", textTransform:"uppercase", marginBottom:14 }}>Session Breakdown</div>
+                  <div style={{ overflowX:"auto" }}>
+                    <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                      <thead><tr>{["Session","Trades","Win Rate","Net PnL"].map(h=><th key={h} style={thSt}>{h}</th>)}</tr></thead>
+                      <tbody>{rows.map(r=>(
+                        <tr key={r.name}>
+                          <td style={{ ...tdSt, fontWeight:600, color:C.textBright }}>{r.name}</td>
+                          <td style={tdSt}>{r.wins+r.losses}</td>
+                          <td style={{ ...tdSt, color:(r.wins/(r.wins+r.losses||1)*100)>=50?C.green:C.red }}>{(r.wins/(r.wins+r.losses||1)*100).toFixed(0)}%</td>
+                          <td style={{ ...tdSt, fontWeight:700, color:r.pnl>=0?C.green:C.red }}>{fmtUSD(r.pnl,true)}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
       </div>
-
-      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
     </div>
   );
 }
